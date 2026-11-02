@@ -1,0 +1,726 @@
+package edu.brandeis.cosi103a.groupa;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import edu.brandeis.cosi.atg.cards.Card;
+import edu.brandeis.cosi.atg.decisions.BuyDecision;
+import edu.brandeis.cosi.atg.decisions.DiscardCardDecision;
+import edu.brandeis.cosi.atg.decisions.Decision;
+import edu.brandeis.cosi.atg.decisions.EndPhaseDecision;
+import edu.brandeis.cosi.atg.decisions.PlayCardDecision;
+import edu.brandeis.cosi.atg.decisions.TrashCardDecision;
+import edu.brandeis.cosi.atg.engine.Engine;
+import edu.brandeis.cosi.atg.engine.PlayerViolationException;
+import edu.brandeis.cosi.atg.event.DiscardCardEvent;
+import edu.brandeis.cosi.atg.event.EndTurnEvent;
+import edu.brandeis.cosi.atg.event.GameEvent;
+import edu.brandeis.cosi.atg.event.Event;
+import edu.brandeis.cosi.atg.event.GameEndEvent;
+import edu.brandeis.cosi.atg.event.GameObserver;
+import edu.brandeis.cosi.atg.event.GameStartEvent;
+import edu.brandeis.cosi.atg.event.GainCardEvent;
+import edu.brandeis.cosi.atg.event.PlayCardEvent;
+import edu.brandeis.cosi.atg.event.TrashCardEvent;
+import edu.brandeis.cosi.atg.player.Player;
+import edu.brandeis.cosi.atg.state.CardStacks;
+import edu.brandeis.cosi.atg.state.GameResult;
+import edu.brandeis.cosi.atg.state.GameState;
+import edu.brandeis.cosi.atg.state.Hand;
+import edu.brandeis.cosi.atg.state.PlayerResult;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+/**
+ * A lightweight implementation of the ATG engine interface for local play and testing.
+ *
+ * <p>This engine now uses the official ATG API surface instead of the older
+ * prototype-specific Supply/PlayerState/PurchaseStrategy model.</p>
+ */
+public final class GameEngine implements Engine {
+
+    private static final int STARTING_HAND_SIZE = 5;
+    private static final int STARTING_BITCOINS = 7;
+    private static final int STARTING_METHODS = 3;
+    private static final int FRAMEWORKS_TWO_PLAYER = 8;
+    private static final int FRAMEWORKS_THREE_PLUS_PLAYER = 12;
+    private static final int BUGS_PER_PLAYER = 10;
+
+    private final List<Player> players;
+    private final List<Card.Type> actionCards;
+    private final Random rng;
+    private final List<DeckState> deckStates;
+    private final EnumMap<Card.Type, Integer> supplyCounts;
+    private final ActionCardResolver actionCardResolver;
+    private int currentPlayerIndex;
+    private int nextCardId;
+    private GameObserver observer;
+    private Event lastEvent;
+
+    /**
+     * Constructs an ATG-compatible engine with a random source.
+     *
+     * @param players the participating players
+     * @param actionCards the 10 action card types to include for this game
+     */
+    public GameEngine(List<Player> players, List<Card.Type> actionCards) {
+        this(players, actionCards, new Random());
+    }
+
+    GameEngine(List<Player> players, List<Card.Type> actionCards, Random rng) {
+        this.players = validatePlayers(players);
+        this.actionCards = validateActionCards(actionCards);
+        this.rng = Objects.requireNonNull(rng, "rng must not be null");
+        this.deckStates = new ArrayList<>();
+        this.supplyCounts = initializeSupply(this.players.size(), this.actionCards);
+        this.actionCardResolver = new ActionCardResolver();
+        this.currentPlayerIndex = 0;
+        this.nextCardId = 1;
+
+        initializePlayerDecks();
+    }
+
+    @Override
+    /**
+     * Runs the game loop until the Framework pile is empty and returns ranked results.
+     *
+     * @return final game result with ranked player outcomes
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    @SuppressWarnings("nullness")
+    public GameResult play() throws PlayerViolationException {
+        emitGlobalEvent(new GameStartEvent(
+            ImmutableList.copyOf(players.stream().map(Player::getName).toList()),
+            new CardStacks(ImmutableMap.copyOf(supplyCounts))
+        ));
+
+        while (supplyCounts.getOrDefault(Card.Type.FRAMEWORK, 0) > 0) {
+            takeTurn(currentPlayerIndex);
+            currentPlayerIndex = (currentPlayerIndex + 1) % players.size();
+        }
+
+        List<PlayerResult> results = new ArrayList<>();
+        for (int i = 0; i < players.size(); i++) {
+            DeckState state = deckStates.get(i);
+            ImmutableList.Builder<Card> endingDeck = ImmutableList.builder();
+            for (Card card : state.allCards()) {
+                endingDeck.add(Objects.requireNonNull(card));
+            }
+            results.add(new PlayerResult(
+                players.get(i).getName(),
+                score(state),
+                endingDeck.build()
+            ));
+        }
+
+        results.sort(Comparator.comparingInt(PlayerResult::score).reversed()
+            .thenComparing(PlayerResult::playerName));
+        GameResult gameResult = new GameResult(ImmutableList.copyOf(results));
+        emitGlobalEvent(new GameEndEvent(new CardStacks(ImmutableMap.copyOf(supplyCounts)), gameResult));
+        return gameResult;
+    }
+
+    @Override
+    public void setObserver(GameObserver observer) {
+        this.observer = observer;
+    }
+
+    /**
+     * Notifies the configured observer about a game event if one is present.
+     *
+     * @param playerIndex player whose state should be snapshotted for the event
+     * @param phase current phase for the snapshot
+     * @param description event description to log
+     */
+    void notifyEvent(int playerIndex, GameState.TurnPhase phase, String description) {
+        emitEvent(playerIndex, phase, new GameEvent(description));
+    }
+
+    /**
+     * Executes one full turn for the given player.
+     *
+     * @param playerIndex zero-based player index
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    private void takeTurn(int playerIndex) throws PlayerViolationException {
+        DeckState state = deckStates.get(playerIndex);
+        state.actions = 1;
+        state.buys = 1;
+        state.money = 0;
+        state.turnCostReduction = 0;
+
+        emitEvent(playerIndex, GameState.TurnPhase.ACTION,
+            new GameEvent("Turn started for " + players.get(playerIndex).getName()));
+
+        playActionPhase(playerIndex, state);
+        playMoneyPhase(playerIndex, state);
+        playBuyPhase(playerIndex, state);
+        cleanup(state);
+        emitEvent(playerIndex, GameState.TurnPhase.CLEANUP, new EndTurnEvent());
+    }
+
+    /**
+     * Runs the action phase for a player until actions are exhausted or the phase ends.
+     *
+     * @param playerIndex zero-based player index
+     * @param state mutable deck state for the active player
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    private void playActionPhase(int playerIndex, DeckState state) throws PlayerViolationException {
+        while (state.actions > 0) {
+            List<Decision> options = createCardDecisionOptions(
+                state.unplayedHand,
+                card -> card.category() == Card.Type.Category.ACTION,
+                PlayCardDecision::new
+            );
+            options.add(new EndPhaseDecision(GameState.TurnPhase.ACTION));
+
+            Decision choice = promptPlayer(playerIndex, GameState.TurnPhase.ACTION, options);
+            if (choice instanceof EndPhaseDecision) {
+                return;
+            }
+
+            PlayCardDecision play = (PlayCardDecision) choice;
+            if (!state.unplayedHand.remove(play.card())) {
+                throw new PlayerViolationException("Tried to play a card not in hand");
+            }
+
+            state.playedHand.add(play.card());
+            state.actions--;
+            emitEvent(playerIndex, GameState.TurnPhase.ACTION,
+                new PlayCardEvent(play.card(), players.get(playerIndex).getName()));
+            actionCardResolver.resolve(this, playerIndex, state, play.card());
+        }
+    }
+
+    /**
+     * Runs the money phase for a player until they end the phase.
+     *
+     * @param playerIndex zero-based player index
+     * @param state mutable deck state for the active player
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    private void playMoneyPhase(int playerIndex, DeckState state) throws PlayerViolationException {
+        while (true) {
+            List<Decision> options = createCardDecisionOptions(
+                state.unplayedHand,
+                card -> card.category() == Card.Type.Category.MONEY,
+                PlayCardDecision::new
+            );
+            options.add(new EndPhaseDecision(GameState.TurnPhase.MONEY));
+
+            Decision choice = promptPlayer(playerIndex, GameState.TurnPhase.MONEY, options);
+            if (choice instanceof EndPhaseDecision) {
+                return;
+            }
+
+            PlayCardDecision play = (PlayCardDecision) choice;
+            if (!state.unplayedHand.remove(play.card())) {
+                throw new PlayerViolationException("Tried to play a money card not in hand");
+            }
+
+            state.playedHand.add(play.card());
+            state.money += play.card().value();
+            emitEvent(playerIndex, GameState.TurnPhase.MONEY,
+                new PlayCardEvent(play.card(), players.get(playerIndex).getName()));
+        }
+    }
+
+    /**
+     * Runs the buy phase for a player until buys are exhausted or the phase ends.
+     *
+     * @param playerIndex zero-based player index
+     * @param state mutable deck state for the active player
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    private void playBuyPhase(int playerIndex, DeckState state) throws PlayerViolationException {
+        while (state.buys > 0) {
+            List<Decision> options = new ArrayList<>();
+            for (Map.Entry<Card.Type, Integer> entry : supplyCounts.entrySet()) {
+                Card.Type type = entry.getKey();
+                if (entry.getValue() <= 0) {
+                    continue;
+                }
+
+                if (effectiveCost(type, state) <= state.money) {
+                    options.add(new BuyDecision(type));
+                }
+            }
+            options.add(new EndPhaseDecision(GameState.TurnPhase.BUY));
+
+            Decision choice = promptPlayer(playerIndex, GameState.TurnPhase.BUY, options);
+            if (choice instanceof EndPhaseDecision) {
+                return;
+            }
+
+            BuyDecision buy = (BuyDecision) choice;
+            int cost = effectiveCost(buy.cardType(), state);
+            if (cost > state.money || supplyCounts.getOrDefault(buy.cardType(), 0) <= 0) {
+                throw new PlayerViolationException("Tried to buy an unavailable or unaffordable card");
+            }
+
+            state.money -= cost;
+            state.buys--;
+            supplyCounts.put(buy.cardType(), supplyCounts.get(buy.cardType()) - 1);
+            state.discardPile.add(newCard(buy.cardType()));
+            emitEvent(playerIndex, GameState.TurnPhase.BUY,
+                new GainCardEvent(buy.cardType(), players.get(playerIndex).getName()));
+        }
+    }
+
+    /**
+     * Performs cleanup by discarding hand cards and drawing a new hand.
+     *
+     * @param state mutable deck state for the active player
+     */
+    private void cleanup(DeckState state) {
+        state.discardPile.addAll(state.playedHand);
+        state.discardPile.addAll(state.unplayedHand);
+        state.playedHand.clear();
+        state.unplayedHand.clear();
+        drawCards(state, STARTING_HAND_SIZE);
+    }
+
+    /**
+     * Forces a player to discard until their hand reaches the specified size.
+     *
+     * @param playerIndex zero-based player index
+     * @param handSize target hand size
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    void forceDiscardDownTo(int playerIndex, int handSize) throws PlayerViolationException {
+        DeckState state = deckStates.get(playerIndex);
+        while (state.unplayedHand.size() > handSize) {
+            forceDiscard(playerIndex);
+        }
+    }
+
+    /**
+     * Forces a player to discard up to a specified number of cards.
+     *
+     * @param playerIndex zero-based player index
+     * @param count maximum number of cards to discard
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    void discardUpTo(int playerIndex, int count) throws PlayerViolationException {
+        DeckState state = deckStates.get(playerIndex);
+        int discards = Math.min(count, state.unplayedHand.size());
+        for (int i = 0; i < discards; i++) {
+            forceDiscard(playerIndex);
+        }
+    }
+
+    /**
+     * Forces a player to discard one card from hand.
+     *
+     * @param playerIndex zero-based player index
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    void forceDiscard(int playerIndex) throws PlayerViolationException {
+        DeckState state = deckStates.get(playerIndex);
+        if (state.unplayedHand.isEmpty()) {
+            return;
+        }
+
+        List<Decision> options = createCardDecisionOptions(
+            state.unplayedHand,
+            card -> true,
+            DiscardCardDecision::new
+        );
+
+        Decision choice = promptPlayer(playerIndex, GameState.TurnPhase.DISCARD, options);
+        DiscardCardDecision discard = (DiscardCardDecision) choice;
+        if (!state.unplayedHand.remove(discard.card())) {
+            throw new PlayerViolationException("Tried to discard a card not in hand");
+        }
+        state.discardPile.add(discard.card());
+        emitEvent(playerIndex, GameState.TurnPhase.DISCARD,
+            new DiscardCardEvent(discard.card().type(), players.get(playerIndex).getName()));
+    }
+
+    /**
+     * Forces a player to trash one card from hand.
+     *
+     * @param playerIndex zero-based player index
+     * @param state mutable deck state for the active player
+     * @return the trashed card, or null if hand is empty
+     * @throws PlayerViolationException if a player makes an invalid decision
+     */
+    Card forceTrash(int playerIndex, DeckState state) throws PlayerViolationException {
+        if (state.unplayedHand.isEmpty()) {
+            return null;
+        }
+
+        List<Decision> options = createCardDecisionOptions(
+            state.unplayedHand,
+            card -> true,
+            TrashCardDecision::new
+        );
+
+        Decision choice = promptPlayer(playerIndex, GameState.TurnPhase.ACTION, options);
+        TrashCardDecision trash = (TrashCardDecision) choice;
+        if (!state.unplayedHand.remove(trash.card())) {
+            throw new PlayerViolationException("Tried to trash a card not in hand");
+        }
+        emitEvent(playerIndex, GameState.TurnPhase.ACTION,
+            new TrashCardEvent(trash.card().type(), players.get(playerIndex).getName()));
+        return trash.card();
+    }
+
+    /**
+     * Prompts a player for a decision and validates the selected option.
+     *
+     * @param playerIndex zero-based player index
+     * @param phase active turn phase
+     * @param options legal decision options
+     * @return the validated chosen decision
+     * @throws PlayerViolationException if the player returns an invalid decision
+     */
+    @SuppressWarnings("nullness")
+    Decision promptPlayer(int playerIndex, GameState.TurnPhase phase, List<Decision> options)
+        throws PlayerViolationException {
+        Player player = players.get(playerIndex);
+        ImmutableList.Builder<Decision> immutableOptions = ImmutableList.builder();
+        for (Decision option : options) {
+            immutableOptions.add(Objects.requireNonNull(option));
+        }
+        GameState state = snapshot(playerIndex, phase);
+
+        try {
+            ImmutableList<Decision> builtOptions = immutableOptions.build();
+            Decision decision = player.makeDecision(state, builtOptions, Optional.ofNullable(lastEvent));
+            if (!builtOptions.contains(decision)) {
+                throw new PlayerViolationException("Player chose a decision not offered by the engine");
+            }
+            return decision;
+        } catch (PlayerViolationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PlayerViolationException("Player threw while making a decision", e);
+        }
+    }
+
+    /**
+     * Builds an immutable game state snapshot for the active player.
+     *
+     * @param playerIndex zero-based player index
+     * @param phase active turn phase
+     * @return immutable snapshot used for player decisions
+     */
+    @SuppressWarnings("nullness")
+    private GameState snapshot(int playerIndex, GameState.TurnPhase phase) {
+        DeckState state = deckStates.get(playerIndex);
+        ImmutableSet.Builder<Card> playedCards = ImmutableSet.builder();
+        for (Card card : state.playedHand) {
+            playedCards.add(Objects.requireNonNull(card));
+        }
+        ImmutableSet.Builder<Card> unplayedCards = ImmutableSet.builder();
+        for (Card card : state.unplayedHand) {
+            unplayedCards.add(Objects.requireNonNull(card));
+        }
+
+        ImmutableMap.Builder<Card.Type, Integer> supplyBuilder = ImmutableMap.builder();
+        for (Map.Entry<Card.Type, Integer> entry : supplyCounts.entrySet()) {
+            supplyBuilder.put(
+                Objects.requireNonNull(entry.getKey()),
+                Objects.requireNonNull(entry.getValue())
+            );
+        }
+
+        Hand hand = new Hand(playedCards.build(), unplayedCards.build());
+        return new GameState(
+            players.get(playerIndex).getName(),
+            hand,
+            phase,
+            state.actions,
+            state.money,
+            state.buys,
+            new CardStacks(supplyBuilder.build())
+        );
+    }
+
+    private void emitEvent(int playerIndex, GameState.TurnPhase phase, Event event) {
+        lastEvent = event;
+        GameState state = snapshot(playerIndex, phase);
+        notifyObserverSafely(observer, state, event);
+        for (Player player : players) {
+            notifyObserverSafely(player.getObserver().orElse(null), state, event);
+        }
+    }
+
+    private void emitGlobalEvent(Event event) {
+        lastEvent = event;
+        int observerPlayerIndex = Math.min(currentPlayerIndex, players.size() - 1);
+        GameState state = snapshot(observerPlayerIndex, GameState.TurnPhase.ACTION);
+        notifyObserverSafely(observer, state, event);
+        for (Player player : players) {
+            notifyObserverSafely(player.getObserver().orElse(null), state, event);
+        }
+    }
+
+    private void notifyObserverSafely(GameObserver observerToNotify, GameState state, Event event) {
+        if (observerToNotify == null) {
+            return;
+        }
+        try {
+            observerToNotify.notifyEvent(state, event);
+        } catch (RuntimeException ignored) {
+            // Observer failures must not interrupt game flow.
+        }
+    }
+
+    /**
+     * Initializes all player decks and draws each opening hand.
+     */
+    private void initializePlayerDecks() {
+        for (int i = 0; i < players.size(); i++) {
+            DeckState deck = new DeckState();
+            for (int j = 0; j < STARTING_BITCOINS; j++) {
+                deck.drawPile.add(newCard(Card.Type.BITCOIN));
+            }
+            for (int j = 0; j < STARTING_METHODS; j++) {
+                deck.drawPile.add(newCard(Card.Type.METHOD));
+            }
+            Collections.shuffle(deck.drawPile, rng);
+            drawCards(deck, STARTING_HAND_SIZE);
+            deckStates.add(deck);
+        }
+    }
+
+    /**
+     * Draws cards into a player's hand, reshuffling when necessary.
+     *
+     * @param state mutable deck state for the active player
+     * @param count number of cards to draw
+     */
+    void drawCards(DeckState state, int count) {
+        for (int i = 0; i < count; i++) {
+            if (state.drawPile.isEmpty()) {
+                if (state.discardPile.isEmpty()) {
+                    return;
+                }
+                state.drawPile.addAll(state.discardPile);
+                state.discardPile.clear();
+                Collections.shuffle(state.drawPile, rng);
+            }
+            state.unplayedHand.add(state.drawPile.remove(state.drawPile.size() - 1));
+        }
+    }
+
+    /**
+     * Checks whether a player's unplayed hand contains Monitoring.
+     *
+     * @param state mutable deck state to inspect
+     * @return true if Monitoring is present
+     */
+    boolean hasMonitoring(DeckState state) {
+        for (Card card : state.unplayedHand) {
+            if (card.type() == Card.Type.MONITORING) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Gives a Bug card to the target player if the Bug pile is not empty.
+     *
+     * @param state mutable deck state for the target player
+     */
+    void gainBug(DeckState state) {
+        if (supplyCounts.getOrDefault(Card.Type.BUG, 0) <= 0) {
+            return;
+        }
+        supplyCounts.put(Card.Type.BUG, supplyCounts.get(Card.Type.BUG) - 1);
+        state.discardPile.add(newCard(Card.Type.BUG));
+    }
+
+    /**
+     * Computes victory-point score for a deck state.
+     *
+     * @param state mutable deck state to score
+     * @return total victory points from all victory cards
+     */
+    private int score(DeckState state) {
+        int score = 0;
+        for (Card card : state.allCards()) {
+            if (card.category() == Card.Type.Category.VICTORY) {
+                score += card.value();
+            }
+        }
+        return score;
+    }
+
+    /**
+     * Counts the number of empty supply piles.
+     *
+     * @return number of supply piles with zero cards remaining
+     */
+    int countEmptyPiles() {
+        int empty = 0;
+        for (Integer count : supplyCounts.values()) {
+            if (count == 0) {
+                empty++;
+            }
+        }
+        return empty;
+    }
+
+    /**
+     * Builds decision options from cards selected out of an iterable source.
+     *
+     * @param cards cards to inspect
+     * @param filter predicate that decides whether a card becomes an option
+     * @param factory factory that converts a card into a decision
+     * @return decision list in source order
+     */
+    private List<Decision> createCardDecisionOptions(Iterable<Card> cards, Predicate<Card> filter,
+                                                     Function<Card, Decision> factory) {
+        List<Decision> options = new ArrayList<>();
+        for (Card card : cards) {
+            if (filter.test(card)) {
+                options.add(factory.apply(card));
+            }
+        }
+        return options;
+    }
+
+    /**
+     * Checks whether Monitoring is available to reveal in the requested phase.
+     *
+     * @param state mutable deck state to inspect
+     * @param phase phase in which Monitoring would be used
+     * @return true if Monitoring is present and the phase is REACTION
+     */
+    boolean hasMonitoring(DeckState state, GameState.TurnPhase phase) {
+        if (phase != GameState.TurnPhase.REACTION) {
+            return false;
+        }
+        for (Card card : state.unplayedHand) {
+            if (card.type() == Card.Type.MONITORING) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Computes a card's effective cost after turn-based cost reduction.
+     *
+     * @param type card type being priced
+     * @param state mutable deck state with current reduction
+     * @return non-negative effective purchase cost
+     */
+    private int effectiveCost(Card.Type type, DeckState state) {
+        return Math.max(0, type.cost() - state.turnCostReduction);
+    }
+
+    /**
+     * Creates a new card instance with a unique id.
+     *
+     * @param type card type to create
+     * @return newly created card instance
+     */
+    Card newCard(Card.Type type) {
+        return new Card(type, nextCardId++);
+    }
+
+    /**
+     * Returns the mutable deck state list for action resolution.
+     *
+     * @return mutable player deck states
+     */
+    List<DeckState> deckStates() {
+        return deckStates;
+    }
+
+    /**
+     * Returns the mutable supply counts for action resolution.
+     *
+     * @return mutable supply counts
+     */
+    EnumMap<Card.Type, Integer> supplyCounts() {
+        return supplyCounts;
+    }
+
+    /**
+     * Validates and copies the player list.
+     *
+     * @param players requested players
+     * @return validated immutable player list
+     */
+    private static List<Player> validatePlayers(List<Player> players) {
+        Objects.requireNonNull(players, "players must not be null");
+        if (players.isEmpty()) {
+            throw new IllegalArgumentException("players must not be empty");
+        }
+        if (players.size() > 4) {
+            throw new IllegalArgumentException("ATG supports at most 4 players");
+        }
+        for (Player player : players) {
+            Objects.requireNonNull(player, "players must not contain null");
+        }
+        return List.copyOf(players);
+    }
+
+    /**
+     * Validates and copies the action card list.
+     *
+     * @param actionCards requested action cards
+     * @return validated immutable action card list
+     */
+    private static List<Card.Type> validateActionCards(List<Card.Type> actionCards) {
+        Objects.requireNonNull(actionCards, "actionCards must not be null");
+        if (actionCards.size() != 10) {
+            throw new IllegalArgumentException("Exactly 10 action cards are required");
+        }
+
+        Set<Card.Type> distinct = new HashSet<>(actionCards);
+        if (distinct.size() != 10) {
+            throw new IllegalArgumentException("Action cards must be distinct");
+        }
+
+        for (Card.Type type : actionCards) {
+            Objects.requireNonNull(type, "actionCards must not contain null");
+            if (type.category() != Card.Type.Category.ACTION) {
+                throw new IllegalArgumentException("Selected cards must all be action cards");
+            }
+        }
+        return List.copyOf(actionCards);
+    }
+
+    /**
+     * Initializes supply counts based on player count and selected action cards.
+     *
+     * @param playerCount number of players in the game
+     * @param actionCards selected action card types
+     * @return initialized supply counts
+     */
+    private static EnumMap<Card.Type, Integer> initializeSupply(int playerCount, List<Card.Type> actionCards) {
+        EnumMap<Card.Type, Integer> counts = new EnumMap<>(Card.Type.class);
+        counts.put(Card.Type.BITCOIN, 60);
+        counts.put(Card.Type.ETHEREUM, 40);
+        counts.put(Card.Type.DOGECOIN, 30);
+        counts.put(Card.Type.METHOD, 14);
+        counts.put(Card.Type.MODULE, 8);
+        counts.put(Card.Type.FRAMEWORK, playerCount == 2 ? FRAMEWORKS_TWO_PLAYER : FRAMEWORKS_THREE_PLUS_PLAYER);
+        counts.put(Card.Type.BUG, BUGS_PER_PLAYER * playerCount);
+        for (Card.Type type : actionCards) {
+            counts.put(type, 10);
+        }
+        return counts;
+    }
+
+}

@@ -1,0 +1,312 @@
+# Agent Rules for Implementing Course Software Engineering Tasks (API-First)
+
+These rules guide the agent when generating explanations, designs, or code for this project.
+
+---
+
+# 1. Consult the Provided API Documentation First
+
+Before proposing any implementation, the agent must:
+
+1. **Read and analyze the API documentation located at**
+
+```
+https://www.javadoc.io/doc/io.github.brandeis-cosi-103a/atg-api/latest/index.html
+```
+
+2. Identify:
+
+* relevant interfaces
+* classes
+* method contracts
+* expected data structures.
+
+3. Map the assignment requirements to **existing API structures**.
+
+The API documentation should always be treated as the **primary source of truth for implementation details**.
+
+---
+
+# 2. Implement Functionality Using the API Whenever Possible
+
+All code should be written **around the provided API**, not independently of it.
+
+To be helpful, the agent’s solutions should:
+
+* call API methods rather than recreating the same behavior
+* use API classes and interfaces in method signatures
+* rely on API-defined structures for core logic.
+
+If functionality already exists in the API, **do not re-implement it**.
+
+This project explicitly requires using the **provided ATG API interfaces** for implementation. 
+
+---
+
+# 3. Avoid Creating Parallel Systems Outside the API
+
+The agent should **not introduce alternative implementations** of concepts already defined by the API.
+
+Avoid:
+
+* redefining card types
+* creating custom replacements for API classes
+* duplicating game state structures already handled by the API.
+
+If additional structures are required, they should:
+
+* extend or interact with API types
+* remain minimal and clearly justified.
+
+---
+
+# 4. Ensure All Code Satisfies Assignment Requirements
+
+Before presenting a solution, the agent should verify that the implementation:
+
+* follows the assignment specification
+* implements required behaviors
+* respects constraints described in the project instructions.
+
+For example, code should correctly support:
+
+* game mechanics
+* player behaviors
+* required engine functionality
+* project structure and deliverables.
+
+Meeting the assignment specification is a primary grading criterion. 
+
+---
+
+# 5. Produce Modular and Maintainable Code
+
+Generated code should follow good software engineering practices:
+
+* small, focused methods
+* clear class responsibilities
+* meaningful variable and method names.
+
+Avoid:
+
+* extremely long functions
+* duplicated logic
+* tightly coupled components.
+
+Assignments evaluate code for **encapsulation and modularity**. 
+
+---
+
+# 6. Prefer Simple Designs
+
+When multiple implementations are possible, the agent should choose the **simplest design that meets the requirements**.
+
+Avoid:
+
+* unnecessary abstraction layers
+* complex class hierarchies
+* speculative extensibility.
+
+Prototype implementations should prioritize clarity and correctness over architectural complexity. 
+
+---
+
+# 7. Generate Testable Implementations
+
+Code should be structured so it can be easily tested.
+
+The agent should:
+
+* separate core logic from console or UI interaction
+* write deterministic logic when possible
+* design methods suitable for unit testing.
+
+Testing is an important component of the assignment grading. 
+
+---
+
+# 8. Suggest or Generate Unit Tests
+
+Whenever possible, the agent should propose tests that verify:
+
+* normal behavior
+* boundary conditions
+* incorrect inputs.
+
+Tests should include **clear assertions validating expected behavior**. 
+
+---
+
+# 9. Encourage Incremental Development
+
+Solutions should be developed and integrated in **small increments**.
+
+Recommended workflow:
+
+1. implement a small feature
+2. test the feature
+3. commit changes
+4. extend functionality.
+
+Incremental development reduces integration issues and simplifies debugging. 
+
+---
+
+# 10. Follow Collaborative Development Practices
+
+Assume the project uses modern development workflows:
+
+* git repositories
+* branches
+* pull requests
+* code reviews.
+
+The agent should encourage:
+
+* small commits
+* frequent integration
+* collaborative review.
+
+Team communication and collaboration are core elements of software engineering practice. 
+
+---
+
+# 11. Maintain Academic Integrity
+
+The agent should:
+
+* generate original explanations and code
+* avoid copying external repositories
+* help the user understand the solution.
+
+Students must submit work that reflects their **own effort and understanding**. 
+
+---
+
+# Compact Instruction Version (for Agent Prompt)
+
+> In order to be helpful, your answers should:
+>
+> * consult `/workspaces/group-a/api_document` before proposing any design or code
+> * treat the provided API as the primary implementation reference
+> * map assignment requirements to API classes and methods first
+> * implement functionality using the API rather than re-creating it
+> * ensure all code satisfies the assignment specification
+> * produce modular, readable, and testable code
+> * prefer simple designs over complex architectures
+> * suggest meaningful unit tests
+> * support incremental development and collaborative workflows
+> * maintain academic integrity and explain reasoning when useful.
+
+---
+
+If you'd like, I can also help you create a **short “API-aware Copilot / agent system prompt”** (around **5 lines**) that works extremely well in VSCode and prevents the agent from **ignoring the API or inventing classes**, which is one of the biggest problems with LLM coding agents.
+
+---
+
+# 12. Canonical Card-Movement Rules For This Project
+
+When explaining or changing the game logic in this repository, the agent must preserve the
+actual pile-movement model used by the engine.
+
+## 12.0 Terminology mapping between game rules and code
+
+Use the following mapping when the user describes the game in informal pile language:
+
+* "player supply pile" or "the pile the player draws from" -> primarily `drawPile`
+* "player hand pile" -> `unplayedHand`, and more loosely `unplayedHand + playedHand` when the
+  user is talking about all cards currently in hand/being used this turn
+* "player discard pile" -> `discardPile`
+* "played cards area" -> `playedHand`
+* "trash" -> cards removed from normal pile movement entirely; trashed cards do not return to
+  `drawPile`, `discardPile`, or hand unless an effect explicitly says so
+* "public card piles" or "the cards players buy from" -> the shared `supplyCounts` structure
+* "kingdom card piles" -> the kingdom entries inside shared `supplyCounts`
+* "basic money / victory / bug piles players buy or gain from" -> also entries inside shared
+  `supplyCounts`
+
+When the user says "supply pile", the agent must clarify from context whether they mean:
+
+* the player's personal draw source (`drawPile`, with `discardPile` reshuffled into it when needed)
+* or the shared public supply / kingdom piles (`supplyCounts`)
+
+Do not silently switch between those two meanings.
+
+## 12.1 Global supply vs. player-owned piles
+
+In the current implementation:
+
+* the **public buyable supply** is a shared global card source represented by `supplyCounts`
+* each player owns their personal card zones represented by `DeckState`
+* cards normally move only among that player's own piles unless they are **trashed**
+
+The current `DeckState` uses:
+
+* `drawPile`
+* `discardPile`
+* `unplayedHand`
+* `playedHand`
+
+For high-level reasoning, `unplayedHand` and `playedHand` together are the player's **hand area**
+for the turn, but code changes must respect the real implementation split.
+
+The agent must not describe the game as if each player buys from a private supply pile. Bought
+or gained cards come from the **shared public supply** and then enter the player's deck flow.
+
+## 12.2 Required card flow
+
+Unless a card is explicitly **trashed**, cards should move only through these zones:
+
+1. shared public `supplyCounts` -> player's `discardPile` when a card is bought or gained
+2. player's `drawPile` -> player's `unplayedHand` when drawing
+3. player's `unplayedHand` -> player's `playedHand` when playing a card
+4. player's `unplayedHand` or `playedHand` -> player's `discardPile` during cleanup or discard effects
+5. player's `discardPile` -> player's `drawPile` only when the draw pile is empty and a draw is needed
+
+The agent must not invent any extra persistent pile unless the assignment explicitly requires it.
+
+## 12.3 Draw and reshuffle rule
+
+This rule is mandatory and should be preserved in both code and explanations:
+
+* when a player needs to draw a card and their `drawPile` is empty, if their `discardPile` is not
+  empty, the entire `discardPile` is shuffled and becomes the new `drawPile`
+* after that reshuffle, drawing continues
+* if both `drawPile` and `discardPile` are empty, no further card can be drawn
+
+This is the rule currently implemented in `GameEngine.drawCards(...)`, and future edits must
+continue to follow it.
+
+## 12.4 Buy and gain rule
+
+When a player buys or otherwise gains a card from the shared public supply:
+
+* the card count is reduced from the shared supply
+* the gained card is created as a new card instance
+* the gained card goes to that player's `discardPile`, not directly to hand, unless a specific
+  card effect explicitly says otherwise
+
+## 12.5 Cleanup rule
+
+At cleanup:
+
+* all `playedHand` cards go to `discardPile`
+* all remaining `unplayedHand` cards go to `discardPile`
+* the player then draws a new hand
+* if the draw pile empties during that redraw, the discard pile is shuffled into a new draw pile
+
+## 12.6 Forced discard rule
+
+When an effect says a discard is mandatory:
+
+* use the engine's forced-discard helper behavior
+* the player must choose a `DiscardCardDecision`
+* no `EndPhaseDecision` is offered during that mandatory discard unless the card text explicitly
+  allows optional stopping
+
+## 12.7 Interpretation rule for future agent work
+
+If a future prompt describes the game informally as "one supply pile, one discard pile, and one
+hand pile per player", interpret that as a simplification of card movement, not a reason to
+change the current engine structure. Preserve the existing implementation model unless the user
+explicitly asks for a structural refactor.
